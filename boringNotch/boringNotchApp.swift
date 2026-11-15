@@ -66,6 +66,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var screenUnlockedObserver: Any?
     private var isScreenLocked: Bool = false
     private var windowScreenDidChangeObserver: Any?
+    private var fullscreenVisibilityCancellable: AnyCancellable?
+    private var fullscreenStatusSnapshot: [String: Bool] = [:]
+    private var fullscreenBehaviorEnabled: Bool = false
+    private var fullscreenRevealScreens: Set<String> = []
+    private var fullscreenPointerTimer: Timer?
+    private var fullscreenHideWorkItems: [String: DispatchWorkItem] = [:]
+    private var fullscreenRevealHideWorkItems: [String: DispatchWorkItem] = [:]
     private var dragDetectors: [String: DragDetector] = [:] // UUID -> DragDetector
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -83,6 +90,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             screenUnlockedObserver = nil
         }
         MusicManager.shared.destroy()
+        fullscreenPointerTimer?.invalidate()
+        fullscreenPointerTimer = nil
+        fullscreenHideWorkItems.values.forEach { $0.cancel() }
+        fullscreenRevealHideWorkItems.values.forEach { $0.cancel() }
+        fullscreenHideWorkItems.removeAll()
+        fullscreenRevealHideWorkItems.removeAll()
         cleanupDragDetectors()
         cleanupWindows()
         XPCHelperClient.shared.stopMonitoringAccessibilityAuthorization()
@@ -170,6 +183,301 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             detector.stopMonitoring()
         }
         dragDetectors.removeAll()
+    }
+
+    @MainActor
+    private func fullscreenTarget(for screenUUID: String) -> (NSWindow, BoringViewModel)? {
+        if Defaults[.showOnAllDisplays] {
+            guard let notchWindow = windows[screenUUID],
+                  let viewModel = viewModels[screenUUID]
+            else { return nil }
+            return (notchWindow, viewModel)
+        }
+
+        let uuid = vm.screenUUID ?? coordinator.selectedScreenUUID
+        guard uuid == screenUUID, let notchWindow = window else { return nil }
+        return (notchWindow, vm)
+    }
+
+    private func distance(_ point: NSPoint, to frame: NSRect) -> CGFloat {
+        let dx = max(frame.minX - point.x, max(0, point.x - frame.maxX))
+        let dy = max(frame.minY - point.y, max(0, point.y - frame.maxY))
+        return hypot(dx, dy)
+    }
+
+    private func screenNearestPointer(_ point: NSPoint) -> NSScreen? {
+        // Do NOT use frame.contains(point) here. At the literal top edge the
+        // cursor may equal frame.maxY, which is outside CGRect's half-open max
+        // boundary. That was the reveal bug in v5/v6/v8.
+        guard let screen = NSScreen.screens.min(by: {
+            distance(point, to: $0.frame) < distance(point, to: $1.frame)
+        }) else { return nil }
+
+        return distance(point, to: screen.frame) <= 4 ? screen : nil
+    }
+
+    @MainActor
+    private func setFullscreenSuppressed(_ suppressed: Bool, on screenUUID: String, animated: Bool) {
+        guard let (notchWindow, viewModel) = fullscreenTarget(for: screenUUID) else { return }
+
+        // If the visual state is already correct, do not repeatedly force the
+        // window's mouse routing. A revealed fullscreen notch may intentionally
+        // be click-through outside its visible collapsed geometry.
+        if viewModel.fullscreenSuppressed == suppressed {
+            if suppressed && !notchWindow.ignoresMouseEvents {
+                notchWindow.ignoresMouseEvents = true
+            }
+            return
+        }
+
+        if suppressed {
+            // A hidden fullscreen notch must never block the app underneath.
+            notchWindow.ignoresMouseEvents = true
+        } else if !notchWindow.isVisible {
+            notchWindow.orderFrontRegardless()
+        }
+
+        if animated {
+            withAnimation(.spring(response: 0.45, dampingFraction: 1.0, blendDuration: 0)) {
+                viewModel.fullscreenSuppressed = suppressed
+            }
+        } else {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                viewModel.fullscreenSuppressed = suppressed
+            }
+        }
+
+        // Revealing changes the visual state only. Mouse routing is based on
+        // the actual visible/interactable notch geometry.
+        if !suppressed {
+            updateMousePassthrough(mouse: NSEvent.mouseLocation)
+        }
+
+        print("[BN-v9] \(suppressed ? "SUPPRESS" : "REVEAL") screen=\(screenUUID) animated=\(animated)")
+    }
+
+    @MainActor
+    private func hideFullscreenNotch(on screenUUID: String) {
+        guard fullscreenBehaviorEnabled,
+              (fullscreenStatusSnapshot[screenUUID] ?? false),
+              !fullscreenRevealScreens.contains(screenUUID),
+              let (_, viewModel) = fullscreenTarget(for: screenUUID)
+        else { return }
+
+        fullscreenHideWorkItems[screenUUID]?.cancel()
+        fullscreenHideWorkItems.removeValue(forKey: screenUUID)
+
+        if viewModel.notchState == .open {
+            // First use Boring Notch's normal open -> closed animation.
+            viewModel.close(force: true)
+
+            let item = DispatchWorkItem { [weak self] in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.fullscreenHideWorkItems.removeValue(forKey: screenUUID)
+                    guard self.fullscreenBehaviorEnabled,
+                          (self.fullscreenStatusSnapshot[screenUUID] ?? false),
+                          !self.fullscreenRevealScreens.contains(screenUUID)
+                    else { return }
+                    self.setFullscreenSuppressed(true, on: screenUUID, animated: true)
+                }
+            }
+            fullscreenHideWorkItems[screenUUID] = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.38, execute: item)
+        } else {
+            setFullscreenSuppressed(true, on: screenUUID, animated: true)
+        }
+    }
+
+    @MainActor
+    private func revealFullscreenNotch(on screenUUID: String, mouse: NSPoint) {
+        guard fullscreenBehaviorEnabled,
+              (fullscreenStatusSnapshot[screenUUID] ?? false)
+        else { return }
+
+        let wasRevealed = fullscreenRevealScreens.contains(screenUUID)
+        fullscreenRevealScreens.insert(screenUUID)
+        fullscreenHideWorkItems[screenUUID]?.cancel()
+        fullscreenHideWorkItems.removeValue(forKey: screenUUID)
+        fullscreenRevealHideWorkItems[screenUUID]?.cancel()
+        fullscreenRevealHideWorkItems.removeValue(forKey: screenUUID)
+
+        setFullscreenSuppressed(false, on: screenUUID, animated: true)
+        updateMousePassthrough(mouse: mouse)
+
+        if !wasRevealed {
+            print("[BN-v9] TOP EDGE screen=\(screenUUID) mouse=(\(Int(mouse.x)),\(Int(mouse.y)))")
+        }
+    }
+
+    @MainActor
+    private func scheduleFullscreenRevealHide(on screenUUID: String) {
+        guard fullscreenRevealHideWorkItems[screenUUID] == nil else { return }
+
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.fullscreenRevealHideWorkItems.removeValue(forKey: screenUUID)
+                guard let (_, viewModel) = self.fullscreenTarget(for: screenUUID) else { return }
+
+                let mouse = NSEvent.mouseLocation
+                let screen = NSScreen.screen(withUUID: screenUUID)
+                let distanceFromTop = screen.map { abs($0.frame.maxY - mouse.y) } ?? .greatestFiniteMagnitude
+                let withinHorizontalBounds = screen.map {
+                    mouse.x >= $0.frame.minX - 1 && mouse.x <= $0.frame.maxX + 1
+                } ?? false
+
+                if (withinHorizontalBounds && distanceFromTop <= 110)
+                    || viewModel.fullscreenInteractionActive
+                    || viewModel.notchState == .open
+                    || viewModel.isMouseHovering(position: mouse)
+                {
+                    return
+                }
+
+                self.fullscreenRevealScreens.remove(screenUUID)
+                self.hideFullscreenNotch(on: screenUUID)
+            }
+        }
+
+        fullscreenRevealHideWorkItems[screenUUID] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42, execute: item)
+    }
+
+    @MainActor
+    private func updateMousePassthrough(mouse: NSPoint) {
+        func update(window notchWindow: NSWindow, viewModel: BoringViewModel, screenUUID: String) {
+            let screenIsFullscreen = fullscreenBehaviorEnabled
+                && (fullscreenStatusSnapshot[screenUUID] ?? false)
+
+            // While visually suppressed in fullscreen, the whole panel is
+            // click-through. After reveal, continue below so only real visible
+            // notch content captures the pointer and the menu bar remains usable.
+            if screenIsFullscreen && viewModel.fullscreenSuppressed {
+                if !notchWindow.ignoresMouseEvents {
+                    notchWindow.ignoresMouseEvents = true
+                }
+                return
+            }
+
+            // The NSPanel always retains the full expanded footprint. Make that
+            // entire footprint interactive only when the UI really expands or
+            // another interactive live activity is using it. In the collapsed
+            // state, only the actual visible notch accepts pointer events.
+            let expandedInteractionActive = viewModel.notchState == .open
+                || coordinator.expandingView.show
+                || coordinator.sneakPeek.show
+                || viewModel.isBatteryPopoverActive
+                || viewModel.isCameraExpanded
+                || SharingStateManager.shared.preventNotchClose
+
+            let shouldAcceptMouse = expandedInteractionActive
+                || viewModel.isMouseHovering(position: mouse)
+
+            let shouldIgnore = !shouldAcceptMouse
+            if notchWindow.ignoresMouseEvents != shouldIgnore {
+                notchWindow.ignoresMouseEvents = shouldIgnore
+            }
+        }
+
+        if Defaults[.showOnAllDisplays] {
+            for (uuid, notchWindow) in windows {
+                guard let viewModel = viewModels[uuid] else { continue }
+                update(window: notchWindow, viewModel: viewModel, screenUUID: uuid)
+            }
+        } else if let notchWindow = window {
+            let uuid = vm.screenUUID ?? coordinator.selectedScreenUUID
+            update(window: notchWindow, viewModel: vm, screenUUID: uuid)
+        }
+    }
+
+    @MainActor
+    private func handleFullscreenPointerTick() {
+        let mouse = NSEvent.mouseLocation
+
+        // Reuse the existing lightweight in-process pointer watcher. This is
+        // not shell polling and adds no second timer.
+        updateMousePassthrough(mouse: mouse)
+
+        guard fullscreenBehaviorEnabled else { return }
+        guard let pointerScreen = screenNearestPointer(mouse),
+              let uuid = pointerScreen.displayUUID,
+              (fullscreenStatusSnapshot[uuid] ?? false)
+        else {
+            return
+        }
+
+        let distanceFromTop = abs(pointerScreen.frame.maxY - mouse.y)
+        let withinHorizontalBounds = mouse.x >= pointerScreen.frame.minX - 1
+            && mouse.x <= pointerScreen.frame.maxX + 1
+
+        if withinHorizontalBounds && distanceFromTop <= 12 {
+            revealFullscreenNotch(on: uuid, mouse: mouse)
+            return
+        }
+
+        guard fullscreenRevealScreens.contains(uuid) else { return }
+        let viewModel = fullscreenTarget(for: uuid)?.1
+        let keepVisible = (withinHorizontalBounds && distanceFromTop <= 110)
+            || (viewModel?.fullscreenInteractionActive ?? false)
+            || (viewModel?.notchState == .open)
+            || (viewModel?.isMouseHovering(position: mouse) ?? false)
+
+        if keepVisible {
+            fullscreenRevealHideWorkItems[uuid]?.cancel()
+            fullscreenRevealHideWorkItems.removeValue(forKey: uuid)
+        } else {
+            scheduleFullscreenRevealHide(on: uuid)
+        }
+    }
+
+    @MainActor
+    private func setupFullscreenPointerWatcher() {
+        fullscreenPointerTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleFullscreenPointerTick()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        fullscreenPointerTimer = timer
+    }
+
+    @MainActor
+    private func applyFullscreenState(previous: [String: Bool]? = nil) {
+        for screen in NSScreen.screens {
+            guard let uuid = screen.displayUUID else { continue }
+            let isFullscreen = fullscreenBehaviorEnabled
+                && (fullscreenStatusSnapshot[uuid] ?? false)
+            let wasFullscreen = previous?[uuid] ?? false
+
+            if isFullscreen {
+                if !wasFullscreen {
+                    print("[BN-v9] FULLSCREEN ENTER screen=\(uuid)")
+                }
+                if fullscreenRevealScreens.contains(uuid) {
+                    setFullscreenSuppressed(false, on: uuid, animated: true)
+                } else {
+                    hideFullscreenNotch(on: uuid)
+                }
+            } else {
+                if wasFullscreen {
+                    print("[BN-v9] FULLSCREEN EXIT screen=\(uuid)")
+                }
+                fullscreenRevealScreens.remove(uuid)
+                fullscreenHideWorkItems[uuid]?.cancel()
+                fullscreenRevealHideWorkItems[uuid]?.cancel()
+                fullscreenHideWorkItems.removeValue(forKey: uuid)
+                fullscreenRevealHideWorkItems.removeValue(forKey: uuid)
+
+                // Restore without an animation on Space exit. This prevents the
+                // misleading "animates in on the desktop" behavior from v7/v8.
+                setFullscreenSuppressed(false, on: uuid, animated: false)
+                updateMousePassthrough(mouse: NSEvent.mouseLocation)
+            }
+        }
     }
 
     private func setupDragDetectors() {
@@ -419,6 +727,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             adjustWindowPosition(changeAlpha: true)
         }
+
+        let fullscreenEnabledPublisher = Defaults
+            .publisher(.hideNotchOption)
+            .map(\.newValue)
+            .map { $0 != .never }
+            .removeDuplicates()
+
+        fullscreenVisibilityCancellable = Publishers.CombineLatest(
+            FullscreenMediaDetector.shared.$fullscreenStatus.removeDuplicates(),
+            fullscreenEnabledPublisher
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] fullscreenStatus, enabled in
+            guard let self else { return }
+            Task { @MainActor in
+                let previous = self.fullscreenStatusSnapshot
+                self.fullscreenStatusSnapshot = fullscreenStatus
+                self.fullscreenBehaviorEnabled = enabled
+                if !enabled {
+                    self.fullscreenRevealScreens.removeAll()
+                }
+                self.applyFullscreenState(previous: previous)
+            }
+        }
+
+        fullscreenStatusSnapshot = FullscreenMediaDetector.shared.fullscreenStatus
+        fullscreenBehaviorEnabled = Defaults[.hideNotchOption] != .never
+        setupFullscreenPointerWatcher()
+        applyFullscreenState()
 
         setupDragDetectors()
 

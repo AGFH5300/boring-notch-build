@@ -26,7 +26,9 @@ class BoringViewModel: NSObject, ObservableObject {
     @Published var anyDropZoneTargeting: Bool = false
     var cancellables: Set<AnyCancellable> = []
     
-    @Published var hideOnClosed: Bool = true
+    @Published var hideOnClosed: Bool = false
+    @Published var fullscreenSuppressed: Bool = false
+    @Published var fullscreenInteractionActive: Bool = false
 
     @Published var edgeAutoOpenActive: Bool = false
     @Published var isHoveringCalendar: Bool = false
@@ -94,10 +96,8 @@ class BoringViewModel: NSObject, ObservableObject {
             }
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] shouldHide in
-                withAnimation(.smooth) {
-                    self?.hideOnClosed = shouldHide
-                }
+            .sink { [weak self] _ in
+                self?.hideOnClosed = false
             }
             .store(in: &cancellables)
     }
@@ -190,6 +190,7 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     func open() {
+        guard !fullscreenSuppressed else { return }
         self.notchSize = openNotchSize
         self.notchState = .open
         
@@ -197,9 +198,10 @@ class BoringViewModel: NSObject, ObservableObject {
         MusicManager.shared.forceUpdate()
     }
 
-    func close() {
-        // Do not close while a share picker or sharing service is active
-        if SharingStateManager.shared.preventNotchClose {
+    func close(force: Bool = false) {
+        // Do not close while a share picker or sharing service is active unless
+        // fullscreen suppression explicitly needs to collapse the notch.
+        if !force && SharingStateManager.shared.preventNotchClose {
             return
         }
         self.notchSize = getClosedNotchSize(screenUUID: self.screenUUID)

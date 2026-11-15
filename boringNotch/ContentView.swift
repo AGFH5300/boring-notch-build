@@ -129,6 +129,7 @@ struct ContentView: View {
                     }
                     .contentShape(Rectangle())
                     .onHover { hovering in
+                        vm.fullscreenInteractionActive = hovering
                         handleHover(hovering)
                     }
                     .onTapGesture {
@@ -204,6 +205,9 @@ struct ContentView: View {
         }
         .padding(.bottom, 8)
         .frame(maxWidth: windowSize.width, maxHeight: windowSize.height, alignment: .top)
+        .scaleEffect(x: 1, y: vm.fullscreenSuppressed ? 0.001 : 1, anchor: .top)
+        .opacity(vm.fullscreenSuppressed ? 0 : 1)
+        .animation(.spring(response: 0.45, dampingFraction: 1.0, blendDuration: 0), value: vm.fullscreenSuppressed)
         .compositingGroup()
         .scaleEffect(
             x: gestureScale,

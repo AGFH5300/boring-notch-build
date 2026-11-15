@@ -1,5 +1,6 @@
 import Foundation
 import Cocoa
+import ApplicationServices
 import AsyncXPCConnection
 
 final class XPCHelperClient: NSObject {
@@ -96,56 +97,42 @@ final class XPCHelperClient: NSObject {
     }
     
     // MARK: - Accessibility
-    
+
+    // Accessibility-sensitive event taps are created by the main boringNotch
+    // process, not by the XPC helper. Query and request TCC authorization in
+    // this process so the settings state matches the process that actually
+    // needs Accessibility access. The helper remains responsible only for
+    // brightness operations below.
     nonisolated func requestAccessibilityAuthorization() {
-        Task {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            try? await service.withService { service in
-                service.requestAccessibilityAuthorization()
-            }
-        }
+        let options = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
     }
-    
+
     nonisolated func isAccessibilityAuthorized() async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            let result: Bool = try await service.withContinuation { service, continuation in
-                service.isAccessibilityAuthorized { authorized in
-                    continuation.resume(returning: authorized)
-                }
-            }
-            await MainActor.run {
-                notifyAuthorizationChange(result)
-            }
-            return result
-        } catch {
-            return false
+        let result = AXIsProcessTrusted()
+        await MainActor.run {
+            notifyAuthorizationChange(result)
         }
+        return result
     }
-    
+
     nonisolated func ensureAccessibilityAuthorization(promptIfNeeded: Bool) async -> Bool {
-        do {
-            let service = await MainActor.run {
-                ensureRemoteService()
-            }
-            let result: Bool = try await service.withContinuation { service, continuation in
-                service.ensureAccessibilityAuthorization(promptIfNeeded) { authorized in
-                    continuation.resume(returning: authorized)
-                }
-            }
-            await MainActor.run {
-                notifyAuthorizationChange(result)
-            }
-            return result
-        } catch {
-            return false
+        var result = AXIsProcessTrusted()
+
+        if !result && promptIfNeeded {
+            requestAccessibilityAuthorization()
+            try? await Task.sleep(for: .milliseconds(500))
+            result = AXIsProcessTrusted()
         }
+
+        await MainActor.run {
+            notifyAuthorizationChange(result)
+        }
+        return result
     }
-    
+
     // MARK: - Keyboard Brightness
     
     nonisolated func isKeyboardBrightnessAvailable() async -> Bool {
