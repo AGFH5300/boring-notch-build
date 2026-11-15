@@ -66,6 +66,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var screenUnlockedObserver: Any?
     private var isScreenLocked: Bool = false
     private var windowScreenDidChangeObserver: Any?
+    private var fullscreenVisibilityCancellable: AnyCancellable?
     private var dragDetectors: [String: DragDetector] = [:] // UUID -> DragDetector
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -170,6 +171,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             detector.stopMonitoring()
         }
         dragDetectors.removeAll()
+    }
+
+    // MARK: - Hard fullscreen visibility
+    //
+    // Boring Notch normally changes its SwiftUI layout when fullscreen
+    // detection is active, but its floating NSPanel can remain present.
+    //
+    // This removes the ACTUAL AppKit window from the WindowServer while
+    // another app owns the fullscreen space. The Boring Notch process,
+    // media controllers, settings, state and services remain running.
+    //
+    // When fullscreen ends, the exact same window is immediately ordered
+    // back to the front.
+
+    @MainActor
+    private func applyFullscreenWindowVisibility(
+        _ fullscreenStatus: [String: Bool],
+        enabled: Bool
+    ) {
+        func apply(to notchWindow: NSWindow, shouldHide: Bool) {
+            if shouldHide {
+                if notchWindow.isVisible {
+                    notchWindow.orderOut(nil)
+                }
+            } else {
+                if !notchWindow.isVisible {
+                    notchWindow.orderFrontRegardless()
+                }
+            }
+        }
+
+        if Defaults[.showOnAllDisplays] {
+            // Handle every monitor independently.
+            // A fullscreen app on display A only hides the notch on display A.
+            for (uuid, notchWindow) in windows {
+                let shouldHide =
+                    enabled && (fullscreenStatus[uuid] ?? false)
+
+                apply(
+                    to: notchWindow,
+                    shouldHide: shouldHide
+                )
+            }
+        } else if let notchWindow = window {
+            // Single-display mode.
+            let uuid =
+                vm.screenUUID
+                ?? coordinator.selectedScreenUUID
+
+            let shouldHide =
+                enabled && (fullscreenStatus[uuid] ?? false)
+
+            apply(
+                to: notchWindow,
+                shouldHide: shouldHide
+            )
+        }
     }
 
     private func setupDragDetectors() {
@@ -418,6 +476,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             adjustWindowPosition(changeAlpha: true)
         } else {
             adjustWindowPosition(changeAlpha: true)
+        }
+
+        // HARD fullscreen hiding:
+        //
+        // Use Boring Notch's existing MacroVisionKit fullscreen detector,
+        // but control the actual NSPanel rather than merely shrinking/
+        // hiding the SwiftUI content.
+        //
+        // This is event-driven. There is no polling timer.
+
+        let fullscreenEnabledPublisher = Defaults
+            .publisher(.hideNotchOption)
+            .map(\.newValue)
+            .map { $0 != .never }
+            .removeDuplicates()
+
+        fullscreenVisibilityCancellable = Publishers.CombineLatest(
+            FullscreenMediaDetector.shared.$fullscreenStatus
+                .removeDuplicates(),
+            fullscreenEnabledPublisher
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] fullscreenStatus, enabled in
+            guard let self = self else { return }
+
+            Task { @MainActor in
+                self.applyFullscreenWindowVisibility(
+                    fullscreenStatus,
+                    enabled: enabled
+                )
+            }
+        }
+
+        // Apply the current state immediately as well. This covers the
+        // case where Boring Notch itself is launched while another app
+        // is already fullscreen.
+        Task { @MainActor in
+            self.applyFullscreenWindowVisibility(
+                FullscreenMediaDetector.shared.fullscreenStatus,
+                enabled: Defaults[.hideNotchOption] != .never
+            )
         }
 
         setupDragDetectors()
